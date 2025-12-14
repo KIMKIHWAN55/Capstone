@@ -152,7 +152,7 @@ class ESN():
         if not self.silent:
             print("fitting...")
         # we'll disregard the first few states:
-        transient = min(int(inputs.shape[1] / 10), 100)
+        transient = transient = min(int(inputs.shape[0] * 0.1), 100)
         # include the raw inputs:
         extended_states = np.hstack((states, inputs_scaled))
         # Solve for W_out:

@@ -1,3 +1,5 @@
+# 파일명: ESN_GA.py (수정완료: 수수료 고정, 변동성 필터 완화)
+
 import pandas as pd
 import numpy as np
 import random
@@ -11,52 +13,167 @@ import talib
 
 warnings.filterwarnings('ignore')
 
+# ==================================================
+# 1. 백테스팅 전략 클래스 (CV_ESN3.py와 로직 통일)
+# ==================================================
 class PredictedSignalStrategy(Strategy):
-    # ATR 계산을 위한 파라미터 (이 값들도 나중에 GA로 최적화 가능)
-    atr_period = 14      # ATR 계산 기간 (일반적으로 14 사용)
-    atr_multiplier = None # 손절매를 위한 ATR 배수 (보통 2 또는 3 사용)
-    tp_ratio = None
+    # --- GA가 최적화할 파라미터들 (기본값 유지) ---
+    atr_period     = 14    
+    atr_multiplier = 2.0   
+    tp_ratio       = 1.5   
+    min_hold       = 3     
+    cooldown       = 2     
+    risk_per_trade = 0.05  
 
     def init(self):
-        # 기존 signal 정의는 그대로 둡니다.
+        # 1. ESN 신호
         self.signal = self.I(lambda x: x, self.data.Predicted_Signals, name='signal')
         
-        # ATR 지표를 계산하고 self.atr에 저장합니다.
-        self.atr = self.I(talib.ATR, 
-                          self.data.High, 
-                          self.data.Low, 
-                          self.data.Close, 
-                          timeperiod=self.atr_period, 
-                          name="ATR")
+        # 2. ATR (변동성)
+        self.atr = self.I(talib.ATR, self.data.High, self.data.Low, self.data.Close,
+                          timeperiod=int(self.atr_period), name="ATR")
+        
+        # 3. SMA 120 (장기 추세선)
+        self.sma_trend = self.I(talib.SMA, self.data.Close, timeperiod=120, name="SMA120")
+
+        
+        self._cd = 0  
+        self.entry_bar_index = -1 
+        self.initial_sl_mult = float(self.atr_multiplier) 
+        self.trailing_atr_mult = float(self.tp_ratio) 
+        self.current_trailing_sl_price = 0.0
 
     def next(self):
-        current_signal = self.signal[-1]
+        # 데이터 안전 확보
+        atr_now = float(self.atr[-1])
+        price = float(self.data.Close[-1])
+        if not np.isfinite(atr_now) or atr_now <= 0: return
         
-        if current_signal == -1 and not self.position:
-            current_atr = self.atr[-1]
-            
-            # self.atr_multiplier는 bt.run()에서 전달된 값으로 자동 설정됩니다.
-            sl_price = self.data.Close[-1] - (self.atr_multiplier * current_atr)
-            
-            stop_loss_distance = self.data.Close[-1] - sl_price
-            
-            # self.tp_ratio는 bt.run()에서 전달된 값으로 자동 설정됩니다.
-            tp_price = self.data.Close[-1] + (stop_loss_distance * self.tp_ratio)
-            
-            self.buy(sl=sl_price, tp=tp_price)
-            
-        elif current_signal == 1 and self.position.is_long:
-            self.position.close()
+        # 지표 값 가져오기
+        sma_val = self.sma_trend[-1] if len(self.sma_trend) > 0 and np.isfinite(self.sma_trend[-1]) else price
+        
+        # RSI 가져오기
+        try:
+            rsi_val = self.data.RSI_Value[-1]
+        except AttributeError:
+            rsi_val = 50 
 
+        # Avg ATR 계산
+        if len(self.atr) >= 100:
+            recent_atr = self.atr[-100:]
+            avg_atr_val = np.mean(recent_atr[np.isfinite(recent_atr)])
+        else:
+            avg_atr_val = atr_now
+
+        if self._cd > 0: self._cd -= 1
+        sig = int(self.signal[-1]) 
+
+        # ============================================================
+        # [수정됨] 진입/청산 로직 단순화 (Logic Conflict Resolved)
+        # ============================================================
+        
+        # [수정 1] 진입 로직: OR 조건 제거
+        # 기존: (ESN 매수) OR (강한 추세 & 눌림목) -> 강제 진입 위험
+        # 변경: ESN이 매수 신호(-1)를 보내고 + 가격이 장기 추세(SMA120) 위에 있을 때만 진입
+        #       -> ESN의 예측을 최우선으로 하되, 역추세 진입만 필터링
+        should_enter = (sig == -1) and (price > sma_val)
+
+        # [수정 2] 청산 로직: 경직된 조건 제거
+        # 기존: (ESN 매도) AND (추세가 강하지 않음) -> 급락장에서 청산 지연 위험
+        # 변경: ESN이 매도 신호(1)를 보내면, 추세 강도와 상관없이 즉시 청산 시도
+        #       -> 리스크 관리 우선
+        exit_signal = (sig == 1)
+
+        # --- [매수 실행] ---
+        if should_enter and not self.position and self._cd == 0:
+            
+            # 1. 변동성 필터
+            cutoff_multiplier = 5.0 if (price > sma_val) else 2.0
+            if atr_now > (avg_atr_val * cutoff_multiplier) and rsi_val >= 70:
+                return 
+
+            # 2. 초기 손절(SL) 설정
+            sl_price = price - (self.initial_sl_mult * atr_now)
+            sl_dist = price - sl_price
+            
+            # 3. 리스크(비중) 조절
+            current_risk = float(self.risk_per_trade)
+            
+            # (참고) 기존의 역추세 진입 비중 축소 로직은 should_enter에 price > sma_val 조건이 
+            # 포함되면서 사실상 실행되지 않지만, 안전장치로 둡니다.
+            # if price < sma_val: current_risk *= 0.5
+
+            # 4. 포지션 사이징 및 진입
+            equity = float(self.equity)
+            if sl_dist > 0:
+                size = int(max(1, min(int((equity * current_risk) / sl_dist), int((equity * 0.99) / price))))
+            else:
+                size = 1 # 예외 처리
+            
+            if size * price > equity: return
+            self.buy(size=size, sl=sl_price)
+            
+            self.entry_bar_index = len(self.data) - 1
+            self.current_trailing_sl_price = sl_price
+
+# --- [청산 관리 (트레일링 스톱)] ---
+        elif self.position and self.position.is_long:
+            position_age = len(self.data) - 1 - self.entry_bar_index
+            if self.entry_bar_index == -1: position_age = 0
+
+            # [수정] 간소화된 청산 로직 적용
+            if exit_signal and position_age >= int(self.min_hold):
+                self.position.close()
+                self._cd = int(self.cooldown)
+                return
+
+            # ============================================================
+            # [추가] 변동성에 따른 동적 트레일링 스톱 보정 로직
+            # ============================================================
+            
+            # 1. ATR 비율(현재가 대비 변동성) 계산
+            # (예: 주가 100불, ATR 0.4불 -> 0.004 (0.4%))
+            volatility_ratio = atr_now / price 
+
+            # 2. 변동성에 따른 승수(effective_tp_ratio) 조정
+            if volatility_ratio < 0.025: 
+                # 변동성이 매우 낮으면(0.5% 미만, 예: KO), 
+                # 이익 실현 목표를 2.5배 이하로 강제하여 빨리 챙김
+                effective_tp_ratio = min(self.trailing_atr_mult, 3.5) 
+            else:
+                # 변동성이 크면(테슬라 등), 원래 GA가 찾은 값(길게) 유지
+                effective_tp_ratio = self.trailing_atr_mult
+
+            # 3. 새로운 손절가(Trailing Stop) 계산 적용
+            new_sl = price - (effective_tp_ratio * atr_now)
+            
+            # ============================================================
+
+            # 트레일링 스톱 갱신 (가격이 올라가면 SL도 따라 올라감)
+            if new_sl > self.current_trailing_sl_price:
+                self.current_trailing_sl_price = new_sl
+                self.position.sl = self.current_trailing_sl_price
+
+# =========================
+# GA 탐색 파라미터 공간 (12개로 축소)
+# =========================
 PARAM_RANGES = {
-    'n_reservoir': {'min': 100, 'max': 300, 'type': int},
-    'spectral_radius': {'min': 0.7, 'max': 1.2, 'type': float},
-    'sparsity': {'min': 0.1, 'max': 0.7, 'type': float},
-    'signal_threshold': {'min': 0.1, 'max': 0.5, 'type': float},
-    # --- 추가된 파라미터 ---
-    'atr_multiplier': {'min': 1.0, 'max': 5.0, 'type': float}, # 손절매 ATR 배수
-    'tp_ratio': {'min': 1.5, 'max': 5.0, 'type': float}      # 익절/손절 비율
+    # ESN (5개)
+    'spectral_radius': {'min': 0.80, 'max': 0.99, 'type': float},
+    'sparsity':        {'min': 0.05, 'max': 0.80, 'type': float},
+    'th_buy':          {'min': 0.03, 'max': 0.20, 'type': float}, 
+    'th_sell':         {'min': 0.03, 'max': 0.20, 'type': float}, 
+    'temp_T':          {'min': 1.1,  'max': 2.5,  'type': float}, 
+    
+    # 리스크 관리 (7개)
+    'atr_multiplier':  {'min': 1.0,  'max': 4.0,  'type': float}, # [수정] 초기 SL 승수
+    'tp_ratio':        {'min': 1.5,  'max': 8.0,  'type': float}, # [수정] 트레일링 SL 승수
+    'min_hold':        {'min': 1,    'max': 10,    'type': int},
+    'cooldown':        {'min': 0,    'max': 3,    'type': int},
+    'risk_per_trade':  {'min': 0.01,'max': 0.10, 'type': float},
+
 }
+N_RESERVOIR_FIXED = 400
 
 try:
     creator.create("FitnessMax", base.Fitness, weights=(1.0,))
@@ -64,126 +181,206 @@ try:
 except RuntimeError:
     pass
 
+def _rand_in(key):
+    spec = PARAM_RANGES[key]
+    if spec['type'] is int:
+        return random.randint(spec['min'], spec['max'])
+    return random.uniform(spec['min'], spec['max'])
+
 def generate_individual():
-    n_res = random.randint(PARAM_RANGES['n_reservoir']['min'], PARAM_RANGES['n_reservoir']['max'])
-    spec_rad = random.uniform(PARAM_RANGES['spectral_radius']['min'], PARAM_RANGES['spectral_radius']['max'])
-    sp = random.uniform(PARAM_RANGES['sparsity']['min'], PARAM_RANGES['sparsity']['max'])
-    sig_thresh = random.uniform(PARAM_RANGES['signal_threshold']['min'], PARAM_RANGES['signal_threshold']['max'])
-    # --- 추가된 파라미터 ---
-    atr_multi = random.uniform(PARAM_RANGES['atr_multiplier']['min'], PARAM_RANGES['atr_multiplier']['max'])
-    tp_r = random.uniform(PARAM_RANGES['tp_ratio']['min'], PARAM_RANGES['tp_ratio']['max'])
-    return [n_res, spec_rad, sp, sig_thresh, atr_multi, tp_r]
+    """ 10개 파라미터 개체 생성 """
+    return [
+        _rand_in('spectral_radius'),
+        _rand_in('sparsity'),
+        _rand_in('th_buy'),
+        _rand_in('th_sell'),
+        _rand_in('temp_T'),
+        _rand_in('atr_multiplier'),
+        _rand_in('tp_ratio'),
+        _rand_in('min_hold'),
+        _rand_in('cooldown'),
+        _rand_in('risk_per_trade'),
+        # [삭제됨] commission, slippage, enforce_delay
+    ]
 
+# =========================
+# 피트니스 함수 (고정값 적용)
+# =========================
 def fitness_function_with_backtesting(params, train_df: pd.DataFrame, test_df: pd.DataFrame, Technical_Signals=None):
-    # 1. 파라미터 언패킹 및 유효 범위 보정
-    n_reservoir, spectral_radius, sparsity, signal_threshold, atr_multiplier, tp_ratio = params
-    
-    n_reservoir = int(round(n_reservoir))
-    n_reservoir = max(PARAM_RANGES['n_reservoir']['min'], min(n_reservoir, PARAM_RANGES['n_reservoir']['max']))
-    spectral_radius = max(PARAM_RANGES['spectral_radius']['min'], min(spectral_radius, PARAM_RANGES['spectral_radius']['max']))
-    sparsity = max(PARAM_RANGES['sparsity']['min'], min(sparsity, PARAM_RANGES['sparsity']['max']))
-    signal_threshold = max(PARAM_RANGES['signal_threshold']['min'], min(signal_threshold, PARAM_RANGES['signal_threshold']['max']))
-    atr_multiplier = max(PARAM_RANGES['atr_multiplier']['min'], min(atr_multiplier, PARAM_RANGES['atr_multiplier']['max']))
-    tp_ratio = max(PARAM_RANGES['tp_ratio']['min'], min(tp_ratio, PARAM_RANGES['tp_ratio']['max']))
-    
+    # [수정] 10개 파라미터만 언패킹
+    (
+        spectral_radius, sparsity, 
+        th_buy, th_sell, temp_T,
+        atr_multiplier, tp_ratio,
+        min_hold, cooldown, risk_per_trade
+    ) = params
+
+    # [추가] 고정 파라미터
+    n_reservoir = N_RESERVOIR_FIXED
+    commission_fixed = 0.0005
+    slippage_fixed = 0.0003
+    enforce_delay = 1
+
+    # 경계 보정 (Clamping)
+    def clamp(v, key):
+        spec = PARAM_RANGES[key]
+        if spec['type'] is int:
+            return int(max(spec['min'], min(int(round(v)), spec['max'])))
+        return float(max(spec['min'], min(float(v), spec['max'])))
+
+    spectral_radius = clamp(spectral_radius, 'spectral_radius')
+    sparsity        = clamp(sparsity,        'sparsity')
+    th_buy          = clamp(th_buy,          'th_buy')
+    th_sell         = clamp(th_sell,         'th_sell')
+    temp_T          = clamp(temp_T,          'temp_T')
+    atr_multiplier  = clamp(atr_multiplier,  'atr_multiplier')
+    tp_ratio        = clamp(tp_ratio,        'tp_ratio')
+    min_hold        = clamp(min_hold,        'min_hold')
+    cooldown        = clamp(cooldown,        'cooldown')
+    risk_per_trade  = clamp(risk_per_trade,  'risk_per_trade')
+
+    # 제약/가중치
+    MDD_HARD_CAP = 35.0
+    MIN_TRADES   = 7
+    MDD_WEIGHT   = 0.04
+    LOG_RETURN_W = 0.15
+
     try:
-        # 2. ESN 모델로 신호 생성
-        backtest_signals_df = esn_signals(
-            train_df=train_df, 
-            test_df=test_df, 
-            Technical_Signals=Technical_Signals, 
-            n_reservoir=n_reservoir, 
-            spectral_radius=spectral_radius, 
-            sparsity=sparsity, 
-            signal_threshold=signal_threshold
+        # 1) ESN 신호 생성
+        sig_df = esn_signals(
+            train_df=train_df,
+            test_df=test_df,
+            Technical_Signals=Technical_Signals,
+            n_reservoir=n_reservoir, # 고정값
+            spectral_radius=spectral_radius,
+            sparsity=sparsity,
+            th_buy=th_buy,
+            th_sell=th_sell,
+            temp_T=temp_T,
+            # random_state는 GA 실행 시 np.random.seed로 제어됨
         )
+        if sig_df.empty or 'Predicted_Signals' not in sig_df.columns:
+            return (-1000.0,)
+
+        # 2) 백테스트 데이터 구성 (1봉 지연 적용)
+        bt_df = test_df.copy()
+        sig = sig_df['Predicted_Signals'].reindex(bt_df.index).fillna(0).astype(np.int8)
+        if enforce_delay == 1:
+            sig = sig.shift(1).fillna(0).astype(np.int8)  
+        bt_df['Predicted_Signals'] = sig
+
+        # 3) 백테스트 실행 (고정 수수료 사용)
+        bt = Backtest(
+            bt_df, PredictedSignalStrategy,
+            cash=10000,
+            commission=commission_fixed, # 고정값
+             slippage=slippage_fixed,   # 필요 시 주석 해제
+            exclusive_orders=True
+        )
+        stats = bt.run(
+            atr_multiplier=float(atr_multiplier),
+            tp_ratio=float(tp_ratio),
+            min_hold=int(min_hold),
+            cooldown=int(cooldown),
+            risk_per_trade=float(risk_per_trade)
+        )
+
+        # 4) 기본 제약 검사
+        n_trades = int(stats['# Trades'])
+        if n_trades < MIN_TRADES: return (-500.0,)
+
+        sharpe = float(stats.get('Sharpe Ratio', np.nan))
+        if not np.isfinite(sharpe): return (-500.0,)
+
+        mdd = abs(float(stats['Max. Drawdown [%]']))
+        if mdd >= MDD_HARD_CAP: return (-800.0,)
+
+        total_return = float(stats['Return [%]'])
+        cagr = float(stats.get('Return (Ann.) [%]', 0.0)) / 100.0
+
+        # 5) 최종 피트니스 계산 (Calmar Ratio 중심)
+        calmar = float(stats.get('Calmar Ratio', 0.0))
         
-        # 신호 생성이 안된 경우 페널티
-        if backtest_signals_df.empty or 'Predicted_Signals' not in backtest_signals_df.columns:
-            return -1000.0,
-        
-        # 3. 백테스팅 데이터 준비
-        backtest_data = test_df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-        backtest_data['Predicted_Signals'] = backtest_signals_df['Predicted_Signals'].reindex(backtest_data.index).fillna(0)
-        
-        # 4. 백테스팅 실행
-        bt = Backtest(backtest_data, PredictedSignalStrategy, cash=10000, commission=.002, exclusive_orders=True)
-        stats = bt.run(atr_multiplier=atr_multiplier, tp_ratio=tp_ratio)
+        if calmar > 0 and mdd > 1.0:
+            fitness = calmar
+        else:
+            fitness = -100.0 + total_return # 패널티 완화
 
-        # 거래가 없는 경우 페널티
-        if stats['# Trades'] == 0:
-            return -100.0,
+        # 보정
+        fitness *= (0.9 + 0.1 * min(1.0, n_trades / (MIN_TRADES * 2)))
+        if np.isfinite(cagr):
+            fitness *= (0.8 + 0.2 * max(0.0, min(1.0, cagr / 0.15)))
 
-        # ======================================================================
-        # 5. 피트니스 계산 (수익률 기반 + MDD 페널티)
-        # ======================================================================
-
-        # 기본 점수는 총수익률로 설정
-        total_return = stats['Return [%]']
-
-        # MDD(최대 낙폭)를 위험 관리 지표로 사용
-        max_drawdown = abs(stats['Max. Drawdown [%]'])
-
-        # 수익률에서 MDD를 직접 빼서 위험 조정 수익을 계산
-        # 예: 수익률이 30%이고 MDD가 20%이면 최종 점수는 10점
-        # 예: 수익률이 15%이고 MDD가 25%이면 최종 점수는 -10점
-        fitness = total_return - max_drawdown
-
-        return fitness,
+        if not np.isfinite(fitness): return (-500.0,)
+        return (float(np.clip(fitness, -1000.0, 1000.0)),)
 
     except Exception:
-        # 그 외 모든 예외 발생 시 페널티
-        return -1000.0,
+        return (-1000.0,)
 
+# =========================
+# DEAP 설정
+# =========================
 toolbox = base.Toolbox()
 toolbox.register("individual", tools.initIterate, creator.Individual, generate_individual)
 toolbox.register("population", tools.initRepeat, list, toolbox.individual)
 toolbox.register("evaluate", fitness_function_with_backtesting)
 toolbox.register("mate", tools.cxBlend, alpha=0.5)
-# --- 수정: sigma 리스트에 2개 값 추가 ---
+
+# 10차원 뮤테이션 시그마 (수수료/슬리피지 제외)
 sigma_vals = [
-    (PARAM_RANGES['n_reservoir']['max'] - PARAM_RANGES['n_reservoir']['min']) * 0.1,
     (PARAM_RANGES['spectral_radius']['max'] - PARAM_RANGES['spectral_radius']['min']) * 0.1,
-    (PARAM_RANGES['sparsity']['max'] - PARAM_RANGES['sparsity']['min']) * 0.1,
-    (PARAM_RANGES['signal_threshold']['max'] - PARAM_RANGES['signal_threshold']['min']) * 0.1,
-    (PARAM_RANGES['atr_multiplier']['max'] - PARAM_RANGES['atr_multiplier']['min']) * 0.1, # atr_multiplier용 sigma
-    (PARAM_RANGES['tp_ratio']['max'] - PARAM_RANGES['tp_ratio']['min']) * 0.1      # tp_ratio용 sigma
+    (PARAM_RANGES['sparsity']['max']        - PARAM_RANGES['sparsity']['min'])        * 0.1,
+    (PARAM_RANGES['th_buy']['max']          - PARAM_RANGES['th_buy']['min'])          * 0.1,
+    (PARAM_RANGES['th_sell']['max']         - PARAM_RANGES['th_sell']['min'])         * 0.1,
+    (PARAM_RANGES['temp_T']['max']          - PARAM_RANGES['temp_T']['min'])          * 0.1,
+    (PARAM_RANGES['atr_multiplier']['max']  - PARAM_RANGES['atr_multiplier']['min'])  * 0.1,
+    (PARAM_RANGES['tp_ratio']['max']        - PARAM_RANGES['tp_ratio']['min'])        * 0.1,
+    (PARAM_RANGES['min_hold']['max']        - PARAM_RANGES['min_hold']['min'])        * 0.1,
+    (PARAM_RANGES['cooldown']['max']        - PARAM_RANGES['cooldown']['min'])        * 0.1,
+    (PARAM_RANGES['risk_per_trade']['max']  - PARAM_RANGES['risk_per_trade']['min'])  * 0.1,
 ]
-toolbox.register("mutate", tools.mutGaussian, mu=[0]*6, sigma=sigma_vals, indpb=0.1)
+toolbox.register("mutate", tools.mutGaussian, mu=[0]*len(sigma_vals), sigma=sigma_vals, indpb=0.12)
 toolbox.register("select", tools.selTournament, tournsize=4)
 
-def run_genetic_algorithm(train_df_ga, test_df_ga, technical_signals_list, pop_size=50, num_generations=20, cxpb=0.7, mutpb=0.4, random_seed=42):
+# =========================
+# GA 실행 유틸
+# =========================
+def run_genetic_algorithm(train_df_ga, test_df_ga, technical_signals_list,
+                          pop_size=50, num_generations=20, cxpb=0.7, mutpb=0.4, random_seed=42):
     random.seed(random_seed)
     np.random.seed(random_seed)
+    
     toolbox.evaluate.keywords['train_df'] = train_df_ga
     toolbox.evaluate.keywords['test_df'] = test_df_ga
     toolbox.evaluate.keywords['Technical_Signals'] = technical_signals_list
+
     population = toolbox.population(n=pop_size)
     stats = tools.Statistics(lambda ind: ind.fitness.values[0])
-    stats.register("avg", np.mean)
-    stats.register("std", np.std)
-    stats.register("min", np.min)
-    stats.register("max", np.max)
+    stats.register("avg", np.mean); stats.register("std", np.std)
+    stats.register("min", np.min);  stats.register("max", np.max)
     hof = tools.HallOfFame(1)
-    population, log = algorithms.eaSimple(population, toolbox, cxpb, mutpb, num_generations, stats=stats, halloffame=hof, verbose=True)
+
+    population, log = algorithms.eaSimple(
+        population, toolbox, cxpb, mutpb, num_generations,
+        stats=stats, halloffame=hof, verbose=True
+    )
     best_individual = hof[0]
     return best_individual, log
 
-def find_best_params_with_cv(df_for_tuning, technical_signals_list, n_splits=5, pop_size=30, num_generations=15, random_seed=42):
+# =========================
+# CV → 후보 → 교차평가 → 최종
+# =========================
+def find_best_params_with_cv(df_for_tuning, technical_signals_list,
+                             n_splits=5, pop_size=30, num_generations=15, random_seed=42):
     print(f"--- {n_splits}-분할 교차 검증으로 파라미터 최적화 시작 ---")
     tscv = TimeSeriesSplit(n_splits=n_splits)
-    
-    # ======================================================================
-    # 1단계: 각 Fold에서 최적의 파라미터 '후보군' 찾기
-    # ======================================================================
     candidate_params_list = []
-    all_splits = list(tscv.split(df_for_tuning)) # 재사용을 위해 split 객체를 리스트로 저장
+    all_splits = list(tscv.split(df_for_tuning))
 
-    for i, (train_index, val_index) in enumerate(all_splits):
+    for i, (tr_idx, va_idx) in enumerate(all_splits):
         print(f"\n--- CV Fold {i+1}/{n_splits} (후보 파라미터 탐색) ---")
-        train_cv_df = df_for_tuning.iloc[train_index]
-        val_cv_df = df_for_tuning.iloc[val_index]
-        
+        train_cv_df = df_for_tuning.iloc[tr_idx]
+        val_cv_df   = df_for_tuning.iloc[va_idx]
         best_params_for_fold, _ = run_genetic_algorithm(
             train_df_ga=train_cv_df, test_df_ga=val_cv_df,
             technical_signals_list=technical_signals_list,
@@ -193,61 +390,138 @@ def find_best_params_with_cv(df_for_tuning, technical_signals_list, n_splits=5, 
         candidate_params_list.append(best_params_for_fold)
         print(f"Fold {i+1} 최적 후보: {best_params_for_fold}")
 
-    # ======================================================================
-    # 2단계: 후보 파라미터들을 모든 Fold에 교차 평가하여 가장 안정적인 파라미터 선택
-    # ======================================================================
     print("\n" + "="*50)
     print("후보 파라미터 교차 평가 시작...")
     avg_scores = []
-    
     for i, params in enumerate(candidate_params_list):
         scores_for_params = []
         print(f"  -> 후보 {i+1} 평가 중...")
-        for j, (train_index, val_index) in enumerate(all_splits):
-            train_cv_df = df_for_tuning.iloc[train_index]
-            val_cv_df = df_for_tuning.iloc[val_index]
-            
-            # 백테스팅 실행하여 fitness 점수 계산
+        for j, (tr_idx, va_idx) in enumerate(all_splits):
+            train_cv_df = df_for_tuning.iloc[tr_idx]
+            val_cv_df   = df_for_tuning.iloc[va_idx]
             fitness = fitness_function_with_backtesting(
                 params, train_cv_df, val_cv_df, technical_signals_list
             )[0]
             scores_for_params.append(fitness)
-        
-        # 모든 Fold에 대한 평균 점수 계산
-        avg_score = np.mean(scores_for_params)
+        avg_score = float(np.mean(scores_for_params))
         avg_scores.append(avg_score)
-        print(f"  후보 {i+1}의 5개 Fold 평균 점수: {avg_score:.4f}")
+        print(f"  후보 {i+1}의 {n_splits}개 Fold 평균 점수: {avg_score:.4f}")
 
-    # 가장 높은 평균 점수를 가진 파라미터를 최종 선택
-    best_avg_score_index = np.argmax(avg_scores)
-    final_best_params = candidate_params_list[best_avg_score_index]
-
+    best_idx = int(np.argmax(avg_scores))
+    final_best_params = candidate_params_list[best_idx]
     print("\n" + "="*50)
     print("교차 검증 기반 파라미터 최적화 완료!")
     print(f"최종 선택된 최적 파라미터: {final_best_params}")
-    print(f"(후보 {best_avg_score_index + 1}의 평균 점수가 {avg_scores[best_avg_score_index]:.4f}로 가장 높았습니다)")
+    print(f"(후보 {best_idx+1} 평균 점수 {avg_scores[best_idx]:.4f})")
     print("="*50 + "\n")
-    
     return final_best_params
 
-def esn_rolling_forward(df, technical_signals_list, n_splits_cv=5, n_splits_forward=3, pop_size=30, num_generations=15, random_seed=42, initial_train_ratio=0.7):
+# =========================
+# 롤링 포워드 검증
+# =========================
+def rolling_forward_split(df: pd.DataFrame, n_splits: int, initial_train_ratio: float = 0.5):
+    total_len = len(df)
+    initial_train_size = int(total_len * initial_train_ratio)
+    remaining_len = total_len - initial_train_size
+    val_size = 0 if n_splits == 0 else remaining_len // n_splits
+    for i in range(n_splits):
+        train_end = initial_train_size + i * val_size
+        val_end   = train_end + val_size
+        train_df = df.iloc[:train_end].copy()
+        val_df   = df.iloc[train_end:val_end].copy()
+        if val_df.empty:
+            continue
+        yield train_df, val_df
+
+def perform_final_backtest(train_df, test_df, best_params, technical_signals_list,
+                           random_state=42, fold_num=None):
+    
+    # 1) 10개 파라미터 언패킹
+    (spectral_radius, sparsity, th_buy, th_sell, temp_T,
+     atr_multiplier, tp_ratio, 
+     min_hold, cooldown, risk_per_trade) = best_params
+
+    # 2) clamp 함수 추가 (fitness_function과 동일)
+    def clamp(v, key):
+        spec = PARAM_RANGES[key]
+        if spec['type'] is int:
+            return int(max(spec['min'], min(int(round(v)), spec['max'])))
+        return float(max(spec['min'], min(float(v), spec['max'])))
+
+    # 3) 모든 파라미터 보정
+    spectral_radius = clamp(spectral_radius, 'spectral_radius')
+    sparsity        = clamp(sparsity,        'sparsity')
+    th_buy          = clamp(th_buy,          'th_buy')
+    th_sell         = clamp(th_sell,         'th_sell')
+    temp_T          = clamp(temp_T,          'temp_T')
+    atr_multiplier  = clamp(atr_multiplier,  'atr_multiplier')
+    tp_ratio        = clamp(tp_ratio,        'tp_ratio')
+    min_hold        = clamp(min_hold,        'min_hold')
+    cooldown        = clamp(cooldown,        'cooldown')
+    risk_per_trade  = clamp(risk_per_trade,  'risk_per_trade')
+
+    # 4) 이하 원래 코드 동일
+    n_reservoir = N_RESERVOIR_FIXED
+    commission_fixed = 0.0005
+    slippage_fixed = 0.0003
+    enforce_delay = 1
+
+    sig_df = esn_signals(
+        train_df=train_df, test_df=test_df,
+        Technical_Signals=technical_signals_list,
+        n_reservoir=int(n_reservoir), spectral_radius=float(spectral_radius),
+        sparsity=float(sparsity),
+        th_buy=float(th_buy), th_sell=float(th_sell), temp_T=float(temp_T),
+    )
+    if not isinstance(sig_df, pd.DataFrame) or sig_df.empty or 'Predicted_Signals' not in sig_df.columns:
+        print("ESN 모델에서 유효한 신호가 생성되지 않았습니다. 백테스트 건너뜀.")
+        return None, None
+
+    bt_df = test_df.copy()  # 추천: TA 필터 그대로 사용
+    sig = sig_df['Predicted_Signals'].reindex(bt_df.index).fillna(0).astype(np.int8)
+    if int(enforce_delay) == 1:
+        sig = sig.shift(1).fillna(0).astype(np.int8)
+    bt_df['Predicted_Signals'] = sig
+
+    bt_final = Backtest(
+        bt_df, PredictedSignalStrategy,
+        cash=10000,
+        commission=commission_fixed,
+        slippage=slippage_fixed,
+        exclusive_orders=True
+    )
+
+    stats_final = bt_final.run(
+        atr_multiplier=float(atr_multiplier), 
+        tp_ratio=float(tp_ratio),           
+        min_hold=int(min_hold),
+        cooldown=int(cooldown),
+        risk_per_trade=float(risk_per_trade)
+    )
+
+    print("\n백테스팅 결과:")
+    print(stats_final)
+    
+    if fold_num == "last":
+        bt_final.plot(filename='final_fold_backtest_results', open_browser=False)
+
+    return stats_final, sig_df
+
+def esn_rolling_forward(df, technical_signals_list,
+                        n_splits_cv=5, n_splits_forward=3,
+                        pop_size=30, num_generations=15,
+                        random_seed=42, initial_train_ratio=0.7):
     train_end_idx = int(len(df) * initial_train_ratio)
     df_for_tuning = df.iloc[:train_end_idx]
     best_params = find_best_params_with_cv(
         df_for_tuning=df_for_tuning,
         technical_signals_list=technical_signals_list,
-        n_splits=n_splits_cv,
-        pop_size=pop_size,
-        num_generations=num_generations,
-        random_seed=random_seed
+        n_splits=n_splits_cv, pop_size=pop_size,
+        num_generations=num_generations, random_seed=random_seed
     )
 
-    cv_fitness_scores = []
-    fold_returns = []
-    bh_returns = []
-    all_fold_stats = [] 
+    all_fold_stats = []
     last_fold_signals = None
-    
     splits = list(rolling_forward_split(df, n_splits_forward, initial_train_ratio=initial_train_ratio))
     if not splits:
         print("롤링 포워드 검증을 위한 데이터 분할이 생성되지 않았습니다.")
@@ -259,71 +533,19 @@ def esn_rolling_forward(df, technical_signals_list, n_splits_cv=5, n_splits_forw
         try:
             stats, signals = perform_final_backtest(
                 train_df=train_df, test_df=val_df, best_params=best_params,
-                technical_signals_list=technical_signals_list, fold_num=("last" if i == n_splits_forward - 1 else None),
+                technical_signals_list=technical_signals_list,
+                fold_num=("last" if i == n_splits_forward - 1 else None),
                 random_state=random_seed
             )
             if stats is not None:
-                all_fold_stats.append(stats) 
-                
-                return_percent = stats['Return [%]']
-                max_drawdown = abs(stats['Max. Drawdown [%]'])
-                mdd_penalty = 0
-                if max_drawdown > 30: mdd_penalty = 50
-                elif max_drawdown > 20: mdd_penalty = 25
-                elif max_drawdown > 10: mdd_penalty = 10
-                fitness_value = return_percent - mdd_penalty
-                
-                cv_fitness_scores.append(fitness_value)
-                fold_returns.append(return_percent)
-                bh_returns.append(stats['Buy & Hold Return [%]'])
-
+                all_fold_stats.append(stats)
                 if i == n_splits_forward - 1:
                     last_fold_signals = signals
         except Exception as e:
             print(f"폴드 {i+1} 백테스팅 중 오류 발생: {e}")
             traceback.print_exc()
-            
+
     print("\n" + "="*50)
     print("롤링 포워드 교차 검증 최종 결과 요약:")
-    # ... (요약 출력 부분은 동일) ...
     print("="*50)
-    
-    return best_params, fold_returns, all_fold_stats, last_fold_signals
-
-def perform_final_backtest(train_df, test_df, best_params, technical_signals_list, random_state=42, fold_num=None):
-    n_reservoir, spectral_radius, sparsity, signal_threshold, atr_multiplier, tp_ratio = best_params
-    n_reservoir = int(round(n_reservoir))
-    n_reservoir = max(PARAM_RANGES['n_reservoir']['min'], min(n_reservoir, PARAM_RANGES['n_reservoir']['max']))
-    spectral_radius = max(PARAM_RANGES['spectral_radius']['min'], min(spectral_radius, PARAM_RANGES['spectral_radius']['max']))
-    sparsity = max(PARAM_RANGES['sparsity']['min'], min(sparsity, PARAM_RANGES['sparsity']['max']))
-    signal_threshold = max(PARAM_RANGES['signal_threshold']['min'], min(signal_threshold, PARAM_RANGES['signal_threshold']['max']))
-    final_backtest_signals_df = esn_signals(train_df=train_df, test_df=test_df, Technical_Signals=technical_signals_list, n_reservoir=n_reservoir, spectral_radius=spectral_radius, sparsity=sparsity, signal_threshold=signal_threshold, random_state=random_state)
-    if not isinstance(final_backtest_signals_df, pd.DataFrame) or final_backtest_signals_df.empty or 'Predicted_Signals' not in final_backtest_signals_df.columns:
-        print("ESN 모델에서 유효한 신호가 생성되지 않았습니다. 백테스팅을 건너뜀.")
-        return None, None
-    final_backtest_data = test_df[['Open', 'High', 'Low', 'Close', 'Volume']].copy()
-    final_backtest_data['Predicted_Signals'] = final_backtest_signals_df['Predicted_Signals'].fillna(0)
-    bt_final = Backtest(final_backtest_data, PredictedSignalStrategy, cash=10000, commission=.002, exclusive_orders=True)
-    stats_final = bt_final.run(atr_multiplier=atr_multiplier, tp_ratio=tp_ratio)
-    print("\n백테스팅 결과:")
-    print(stats_final)
-    if fold_num is not None and fold_num == "last":
-        bt_final.plot(filename='final_fold_backtest_results', open_browser=False)
-    return stats_final, final_backtest_signals_df
-
-def rolling_forward_split(df: pd.DataFrame, n_splits: int, initial_train_ratio: float = 0.5):
-    total_len = len(df)
-    initial_train_size = int(total_len * initial_train_ratio)
-    remaining_len = total_len - initial_train_size
-    if n_splits == 0:
-        val_size = 0
-    else:
-        val_size = remaining_len // n_splits
-    for i in range(n_splits):
-        train_end_idx = initial_train_size + i * val_size
-        val_end_idx = train_end_idx + val_size
-        train_df = df.iloc[:train_end_idx].copy()
-        val_df = df.iloc[train_end_idx:val_end_idx].copy()
-        if val_df.empty:
-            continue
-        yield train_df, val_df
+    return best_params, all_fold_stats, last_fold_signals
